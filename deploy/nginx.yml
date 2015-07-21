@@ -1,0 +1,6 @@
+---
+# Nginx
+- hosts: all
+  roles:
+    - common
+    - nginx

@@ -1,0 +1,51 @@
+# file: roles/image/tasks/main.yml
+---
+# For example,
+#
+# - name: be sure ntp is installed
+#   yum: pkg=ntp state=installed
+#   tags: ntp
+#
+# - name: be sure ntp is configured
+#   template: src=ntp.conf.j2 dest=/etc/ntp.conf
+#   notify:
+#     - restart ntpd
+#   tags: ntp
+#
+# - name: be sure ntpd is running and enabled
+#   service: name=ntpd state=running enabled=yes
+#   tags: ntp
+
+- name: Crear directorio src node
+  file: path=/opt/cdn/src/node state=directory mode=0755
+  tags: dir
+
+- name: Crear directorio src nginx
+  file: path=/opt/cdn/src/nginx state=directory mode=0755
+  tags: dir
+
+- name: Copiar index.js src node
+  copy: src=../../../../node/index.js dest=/opt/cdn/src/node/
+  tags: dir
+
+- name: Copiar package.json src node
+  copy: src=../../../../node/package.json dest=/opt/cdn/src/node/
+  tags: dir
+
+- name: Copiar Dockerfile src node
+  copy: src=../../../../node/Dockerfile dest=/opt/cdn/src/node/
+  tags: dir
+
+- name: Copiar Dockerfile src nginx
+  copy: src=../../../../nginx/Dockerfile dest=/opt/cdn/src/nginx/
+  tags: dir
+
+- name: Copiar Dockerfile src nginx
+  copy: src=../../../../nginx/nginx.conf dest=/opt/cdn/src/nginx/
+  tags: dir
+
+- name: Armando imagen Node
+  command: chdir=/opt/cdn/src/node docker build -t unc_cdn/node .
+
+- name: Armando imagen Nginx
+  command: chdir=/opt/cdn/src/nginx docker build -t unc_cdn/nginx .

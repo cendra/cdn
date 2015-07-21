@@ -1,0 +1,4 @@
+# file: roles/node/vars/main.yml
+---
+#
+# foo: bar

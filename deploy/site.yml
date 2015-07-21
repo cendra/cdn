@@ -1,0 +1,5 @@
+# file: site.yml
+---
+- include: image.yml
+- include: nginx.yml
+- include: node.yml

@@ -1,0 +1,18 @@
+{
+  "name": "unc-cdn",
+  "version": "1.0.0",
+  "description": "CDN Universitario",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node index.js"
+  },
+  "keywords": [
+    "CDN"
+  ],
+  "author": "Agustín Moyano",
+  "license": "GPL",
+  "dependencies": {
+    "express": "*"
+  }
+}

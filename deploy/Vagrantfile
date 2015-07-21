@@ -1,0 +1,35 @@
+VAGRANTFILE_API_VERSION = "2"
+
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+
+	config.vm.box = "trusty64"
+	config.vm.box_url = "https://cloud-images.ubuntu.com/vagrant/trusty/current/trusty-server-cloudimg-amd64-vagrant-disk1.box"
+	#config.vm.network "private_network", type: "dhcp"
+
+	config.vm.provision "shell", path: "increase_swap.sh"
+
+	config.vm.provision "ansible" do |ansible|
+		ansible.limit = 'all'
+		ansible.playbook = "site.yml"
+		ansible.verbose = 'vvvv'
+		ansible.host_key_checking = false
+		#ansible.inventory_path = "stage"
+		ansible.extra_vars = { ansible_ssh_user: 'vagrant', private_network_iface: 'ansible_eth1', ansible_connection: 'ssh',
+                 ansible_ssh_args: '-o ForwardAgent=yes' }
+		#ansible.groups = {
+		#	"index-servers" => ["index.local"],
+		#	"vagrant" => ["index-servers:children"]
+		#}
+		ansible.sudo = true
+	end
+	
+#	# Servers
+#	config.vm.define "example.local" do |m|
+#		m.vm.provider :virtualbox do |virtualbox|
+#			virtualbox.customize ["modifyvm", :id, "--memory", "512"] 
+#		end
+#		m.vm.network "private_network", ip: "192.168.1.2" # Vagrant complaints about *.*.*.1
+#		m.vm.network :forwarded_port, guest: 22, host: 2222, id: "ssh"
+#	end
+	
+end

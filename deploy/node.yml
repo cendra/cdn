@@ -1,0 +1,6 @@
+---
+# NodeJS
+- hosts: all
+  roles:
+    - common
+    - node

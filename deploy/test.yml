@@ -1,0 +1,8 @@
+---
+- hosts: all
+  tasks:
+  - local_action: apt state=present name=virtualbox
+    sudo: yes
+  - local_action: apt state=present name=vagrant
+    sudo: yes
+  - local_action: command vagrant up

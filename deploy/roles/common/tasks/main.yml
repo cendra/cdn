@@ -1,0 +1,47 @@
+# file: roles/common/tasks/main.yml
+---
+# For example,
+# 
+# - name: be sure ntp is installed
+#   yum: pkg=ntp state=installed
+#   tags: ntp
+# 
+# - name: be sure ntp is configured
+#   template: src=ntp.conf.j2 dest=/etc/ntp.conf
+#   notify:
+#     - restart ntpd
+#   tags: ntp
+# 
+# - name: be sure ntpd is running and enabled
+#   service: name=ntpd state=running enabled=yes
+#   tags: ntp
+
+#Necesitamos instalar docker
+
+- name: Instalando docker.io (apt)
+  apt: name=docker.io state=present
+  tags: docker
+
+#Necesitamos instalar easy_install para instalar pip (la versión de apt no sirve)
+
+#- name: Instalando easy_install (apt)
+#  apt: name=easy_install state=present
+#  tags: docker
+
+#Necesitamos instalar pip para instalar docker-py (de docker-py que se instala con pip de apt no sirve)
+- name: Instalando python-pip (apt)
+  apt: name=python-pip
+  tags: docker
+
+- name: Instalando docker-py (pip)
+  pip: name=docker-py version=0.3.1
+  tags: docker
+
+- name: docker esta corriendo?
+  service: name=docker.io state=started enabled=yes
+  tags: docker
+
+- name: Crear directorios comunes
+  file: path=/opt/cdn/files state=directory mode=0755
+  file: path=/opt/cdn/config state=directory mode=0755
+  tags: dir

@@ -1,0 +1,11 @@
+# file: roles/image/handlers/main.yml
+---
+# For example,
+# 
+# - name: restart ntpd
+#   service: name=ntpd state=restarted
+
+
+
+- name: pub image
+  local_action: command docker push unc_cdn/node

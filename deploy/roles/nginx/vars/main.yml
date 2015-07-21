@@ -1,0 +1,4 @@
+# file: roles/nginx/vars/main.yml
+---
+#
+# foo: bar

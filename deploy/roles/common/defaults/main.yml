@@ -1,0 +1,4 @@
+# file: roles/common/defaults/main.yml
+---
+#
+# foo: default
