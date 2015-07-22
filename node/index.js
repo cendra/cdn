@@ -127,7 +127,7 @@ var doCloning = function(ops, done) {
   fs.emptyDir(dir,function(err) {
     if(err) return done(err);
     git.Clone(ops.url, dir, {
-      bare: 1,
+      bare: ops.bare||1,
       remoteCallbacks: {
         certificateCheck: function() {
           // github will fail cert check on some OSX machines
@@ -155,6 +155,20 @@ var createProject = function(ops, done) {
   rc.set('cdn:'+ops.org+':repo:'+ops.project, ops.url, function(err){
     if(err) return done(err);
     doCloning(ops, done);
+  });
+};
+
+var getVersionCommit = function(ops, done) {
+  rc.get(id+':cdn:'+ops.org+':repo:'+ops.project+':'+ops.version, function(err, commit){
+    if(err) return done(err);
+    done(null, commit);
+  });
+};
+
+var setVersionCommit = function(ops, done) {
+  rc.set(id+':cdn:'+ops.org+':repo:'+ops.project+':'+ops.version, ops.commit, function(err){
+    if(err) return done(err);
+    done();
   });
 };
 
@@ -191,36 +205,93 @@ async.waterfall([
           fs.ensureDir(path.join(ngSitesPath, org, project), function(err) {
             if(err) return cb(err);
             //Ver todos los branches que se llamen al estilo version_<num> o v<num>
+            var p;
+            if(org == config.org.name) {
+              p = openRepo({project: project});
+            } else {
+              p = new Promise(function(resolve, reject) {
+                cloneProject({org: org, project: project, dest: path.join('/tmp', org, project)}, function(err, repo) {
+                  if(err) return reject(err);
+                  resolve(repo);
+                })
+              });
+            }
             var repo;
-            openRepo({project: project})
-              .then(function(r) {
+
+              p.then(function(r) {
                 repo = r;
                 return getBranches(r);
               })
               .then(function(branches) {
-                return branches
+                //Filtrar los branches que se llamen 'version_<num>, version <num>, version<num>, v_<num>, v <num> o v<num>'
+                var promises = branches
                   .map(function(branch) {
                      return branch.name().match(/v(?:ersion)?(?:_| )?([0-9][.0-9]*)/);
                   })
                   .filter(function(match) {
                     return match;
+                  })
+                  .map(function(version) {
+                    //Obtener el último commit de cada branch
+                    return new Promise(function(resolve, reject) {
+                      repo.getBranchCommit(version[0])
+                        .then(function(commit) {
+                          resolve({name: version[0], num: version[1], commit: {repo: commit});
+                        })
+                        .catch(reject);
+                    })
+                    .then(function(version) {
+                      //Ver si existe el directorio
+                      fs.stat(path.join(ngSitesPath, org, project, 'v'+version.num), function(err, stat) {
+                        version.hasDir = stat&&stat.isDirectory();
+                        resolve(version);
+                      });
+                    })
+                    .then(function(version) {
+                      //Obtengo el ultimo commit guardado en redis
+                      return new Promise(function(resolve, reject) {
+                        getVersionCommit({org: org, project: project, version: version.num}, function (err, commit) {
+                          if(err) return reject(err);
+                          version.commit.redis = commit;
+                          resolve(version);
+                        })
+                      });
+                    });
                   });
+                if(!promises.length) return Promise.reject('No branches to work with.');
+                return Promise.all(promises);
+              })
+              .then(function(versions) {
+                //por cada version comparar si esta al dia
+                return versions.filter(function(version) {
+                  return !version.hasDir || version.commit.repo.toString() != version.commit.redis;
+                });
+              })
+              .then(function(versions) {
+                if(!versions.length) return Promise.reject('Nothing to do.');
+
+                var promises = versions.forEach(function(version) {
+                  //Por cada branch a trabajar, recorrer los directorios (menos .git, bower_components y node_modules) buscando javascripts, css o imagenes
+                  return new Promise(function(resolve, reject) {
+                    //Creo o vacío el directorio
+                    fs.emptyDir(path.join(ngSitesPath, org, project, 'v'+version.num), function(err) {
+                      if(err) return reject(err);
+                      //Obtengo el arbol del branch
+                      version.commit.repo.getTree()
+                      .then(function(tree) {
+                        //Si se encuentran javascripts, css o imagenes, replicar la estructura de directorio en ngSitesPath y minificar
+                      })
+
+                      //Si se encuentra una referencia simbolica 'LATEST', hacer un link simbólico apuntando al branch correspondiente.. caso contrario a la última versión.
+
+                      //Si se encuentra una referencia simbolica 'STABLE', 'TEST' o 'DEV' hacer un link simbólico apuntando al branch correspondiente.
+
+                      //Guardar en redis cual es el último commit del branch
+                    });
+                  });
+                });
               });
-
-
-            //Si hay un branch que no existe, o si el último commit del branch es posterior al registrado en redis clonar el repo en tmp
-
-            //Por cada branch a trabajar, recorrer los directorios (menos .git) buscando javascripts, css o imagenes
-
-            //Si se encuentra, replicar la estructura de directorio en ngSitesPath y minificar. En caso que la versión no exista crear el directorio path.join(ngSitesPath, org, repo, 'v'+version)
-
-            //Si se encuentra un tag 'latest', hacer un link simbólico apuntando al branch correspondiente.. caso contrario a la última versión.
-
-            //Si se encuentra un tag 'stable', 'test' o 'dev' hacer un link simbólico apuntando al branch correspondiente.
-
-            //Guardar en redis cual es el último commit del branch
-
-            //eliminar repo en tmp
+              //eliminar repo en tmp
           });
         }, cb);
       });
