@@ -10,6 +10,11 @@ var config = JSON.parse(fs.readFileSync('config.json'));
 var async = require('async');
 var path = require('path');
 var Promise = require("promise");
+var mime = require('mime-sniffer');
+var lookup = Promise.denodeify(mime.lookup);
+var UglifyJS = require("uglify-js");
+var CleanCSS = require('clean-css');
+var util = require('util');
 
 
 var cdnPath =  path.join('/opt','cdn')
@@ -111,6 +116,14 @@ var getBranches = function(repo) {
   return repo.getReferences().then(function(refs) {
     return refs.filter(function(ref) {
       return ref.isBranch();
+    });
+  });
+}
+
+var getSymbolic = function(repo) {
+  return repo.getReferences().then(function(refs) {
+    return refs.filter(function(ref) {
+      return ref.isSymbolic();
     });
   });
 }
@@ -270,26 +283,129 @@ async.waterfall([
               .then(function(versions) {
                 if(!versions.length) return Promise.reject('Nothing to do.');
 
-                var promises = versions.forEach(function(version) {
+                return Promise.all(versions.forEach(function(version) {
                   //Por cada branch a trabajar, recorrer los directorios (menos .git, bower_components y node_modules) buscando javascripts, css o imagenes
                   return new Promise(function(resolve, reject) {
                     //Creo o vacío el directorio
                     fs.emptyDir(path.join(ngSitesPath, org, project, 'v'+version.num), function(err) {
                       if(err) return reject(err);
-                      //Obtengo el arbol del branch
-                      version.commit.repo.getTree()
-                      .then(function(tree) {
-                        //Si se encuentran javascripts, css o imagenes, replicar la estructura de directorio en ngSitesPath y minificar
-                      })
 
-                      //Si se encuentra una referencia simbolica 'LATEST', hacer un link simbólico apuntando al branch correspondiente.. caso contrario a la última versión.
+                      resolve(
+                        //Obtengo el arbol del branch
+                        version.commit.repo.getTree()
+                        .then(function(tree) {
+                          var treeWalk = function(tree) {
+                            return Promise.all(tree.entries().map(function(entry) {
+                              entryName = path.filename(entry.path());
+                              if(entry.isBlob()) {
+                                if(/.+\.js$/.test(entryName)) {
+                                  var min = UglifyJS.minify(entry.getBlob().content().toString(), {fromString: true});
+                                  return Promise.resolve({path: entry.path(), min: min.code});
+                                } else if (/.+\.css$/.test(entryName)) {
+                                  var min = new CleanCSS().minify(entry.getBlob().content().toString());
+                                  return Promise.resolve({path: entry.path(), min: min.styles});
+                                } else if (/.+\.svg$/.test(entryName)) {
+                                  return new Promise(function(resolve, reject) {
+                                    new Imagemin()
+                                      .src(entry.getBlob().content())
+                                      .use(Imagemin.svgo())
+                                      .run(function(err, files) {
+                                        if(err) return reject(err);
+                                        resolve({path: entry.path(), min: files[0].contents});
+                                      });
+                                  });
+                                } else {
+                                  return lookup(entry.getBlob().content())
+                                          .then(function(info) {
+                                            m = info.mime.match(/image\/(jpeg|png|gif)/.test());
+                                            if(!m[1]) return Promise({path: entry.path(), min: entry.getBlob().content()});
+                                            var middleware;
+                                            switch(m[1]) {
+                                              case 'jpeg':
+                                                middleware = Imagemin.jpegtran({progressive: true});
+                                                break;
+                                              case 'png':
+                                                middleware = Imagemin.optipng({optimizationLevel: 3});
+                                                break;
+                                              case 'gif':
+                                                middleware = Imagemin.gifsicle({interlaced: true});
+                                                break;
+                                            }
+                                            return new Promise(function(resolve, reject) {
+                                              new Imagemin()
+                                                .src(entry.getBlob().content())
+                                                .use(middleware)
+                                                .run(function(err, files) {
+                                                  if(err) return reject(err);
+                                                  resolve({path: entry.path(), min: files[0].contents});
+                                                });
+                                            });
+                                          })
+                                          .catch(function(err) {
+                                            return Promise.resolve(null);
+                                          });
+                                }
+                              } else {
+                                if(entryName != '.git' && entryName != 'node_modules' && entryName != 'bower_components') return treeWalk(entry);
+                                return Promise.resolve(null);
+                              }
+                            }))
+                            .then(function(results) {
+                              var r = results.filter(function(result) {
+                                return result;
+                              });
+                              return r.length?r:null;
+                            });
+                          };
 
-                      //Si se encuentra una referencia simbolica 'STABLE', 'TEST' o 'DEV' hacer un link simbólico apuntando al branch correspondiente.
+                          return treeWalk(tree)
+                            .then(function(filesTree) {
+                              var walkFiles = function(tree) {
+                                var files = [];
+                                tree.forEach(function(entry) {
+                                  if(!entry) return;
+                                  if(util.isArray(entry)) {
+                                    files = files.concat(walkFiles(entry));
+                                  }
+                                  files.push(entry);
+                                });
+                                return files;
+                              };
+                              return walkFiles(filesTree);
+                            });
+                          //Si se encuentran javascripts, css o imagenes, replicar la estructura de directorio en ngSitesPath y minificar
+                        })
+                        .then(function(files) {
+                          if(!files || !files.length) return Promise.resolve();
+                          return Promise.all(files.map(function(file) {
+                            return new Promise(function(resolve, reject) {
+                              fs.outputFile(path.join(ngSitesPath, org, project, 'v'+version.num, file.path), file.min, function(err) {
+                                if(err) return reject(err);
+                                resolve();
+                              });
+                            });
+                          }));
+                        });
+                      );
 
+
+                    });
+                  })
+                  .then(function() {
+                    return new Promise(function(resolve, reject) {
                       //Guardar en redis cual es el último commit del branch
+                      setVersionCommit({org: org, project: project, version: version.num, commit: version.commit.repo.toString()}, function(err) {
+                        if(err) return reject(err);
+                        resolve(versions);
+                      });
                     });
                   });
-                });
+                }));
+              })
+              .then(function(versions) {
+                //Crear las configuraciones correspondientes para nginx
+                //Si se encuentra una referencia simbolica 'LATEST', hacer una config de nginx apuntando al branch correspondiente.. caso contrario a la última versión.
+                //Si se encuentra una referencia simbolica 'STABLE', 'TEST' o 'DEV' hacer una config de nginx apuntando al branch correspondiente.
               });
               //eliminar repo en tmp
           });
