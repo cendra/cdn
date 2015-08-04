@@ -15,6 +15,10 @@ var lookup = Promise.denodeify(mime.lookup);
 var UglifyJS = require("uglify-js");
 var CleanCSS = require('clean-css');
 var util = require('util');
+var rendy = require('rendy');
+var request = require('request');
+var io = require('socket.io')(app, { serveClient: false });
+var ioc = require('socket.io-client');
 
 
 var cdnPath =  path.join('/opt','cdn')
@@ -27,6 +31,8 @@ var ngLogPath = path.join(nginxPath, 'log');
 var ngHtmlPath = path.join(nginxPath, 'html');
 var ngCachePath = path.join(nginxPath, 'cache');
 var ngGeoipPath = path.join(nginxPath, 'geoip');
+
+var sockets = {};
 
 if(!config.org || !config.org.name) {
   console.log('No organization name found');
@@ -58,14 +64,35 @@ if(config.redis.hasOwnProperty('db')) {
   rc.select(config.redis.db);
 }
 
-rc.sadd('cdn:orgs', config.org.name);
+var setOrg = function(org, cb) {
+  return new Promise(function(resolve, reject) {
+    rc.sadd('cdn:orgs', org.name);
+    rc.hmset('cdn:'+org.name, org);
+    resolve();
+  })
+  .nodeify(cb);
+}
+
+
+var getOrg = function(name, cb) {
+  return new Promise(function(resolve, reject) {
+    rc.hgetall('cdn:'+name, function(err, org) {
+      if(err) return reject(err);
+      resolve(org);
+    });
+  })
+  .nodeify(cb);
+}
+
+setOrg(config.org);
+
 /*fs.ensureDir(path.join(reposPath, org), function(err) {
   console.log('Could not create orgs repo directory structure.');
   process.exit();
 });*/
 
 var iRepos = function(org, iterator, done) {
-  rc.smembers('cdn:'+org+':repos', function (err, repos) {
+  rc.smembers('cdn:'+org+':projs', function (err, repos) {
     if(err) return done(err);
     async.each(repos, iterator, done);
   });
@@ -157,7 +184,7 @@ var doCloning = function(ops, done) {
 };
 
 var cloneProject = function(ops, done) {
-  rc.get('cdn:'+ops.org+':repo:'+ops.project, function(err, url){
+  rc.get('cdn:'+ops.org+':proj:'+ops.project, function(err, url){
     if(err) return done(err);
     ops.url = url;
     doCloning(ops, done);
@@ -165,21 +192,31 @@ var cloneProject = function(ops, done) {
 };
 
 var createProject = function(ops, done) {
-  rc.set('cdn:'+ops.org+':repo:'+ops.project, ops.url, function(err){
+  rc.sadd('cdn:'+ops.org+':projs', ops.project.name, function(err) {
     if(err) return done(err);
-    doCloning(ops, done);
-  });
+    if(!ops.project.private) {
+      rc.sadd('cdn:'+ops.org+':projs:public', ops.project.name);
+    } else {
+      rc.sdel('cdn:'+ops.org+':projs:public', ops.project.name);
+    }
+    rc.hmset('cdn:'+ops.org+':proj:'+ops.project.name, ops.project, function(err){
+      if(err) return done(err);
+      ops.url = ops.project.url;
+      ops.project = ops.project.name;
+      doCloning(ops, done);
+    });
+  })
 };
 
 var getVersionCommit = function(ops, done) {
-  rc.get(id+':cdn:'+ops.org+':repo:'+ops.project+':'+ops.version, function(err, commit){
+  rc.get(id+':cdn:'+ops.org+':proj:'+ops.project+':'+ops.version, function(err, commit){
     if(err) return done(err);
     done(null, commit);
   });
 };
 
 var setVersionCommit = function(ops, done) {
-  rc.set(id+':cdn:'+ops.org+':repo:'+ops.project+':'+ops.version, ops.commit, function(err){
+  rc.set(id+':cdn:'+ops.org+':proj:'+ops.project+':'+ops.version, ops.commit, function(err){
     if(err) return done(err);
     done();
   });
@@ -195,8 +232,240 @@ var cloneOrUpdate = function(ops, done) {
   });
 };
 
-var minify = function(org, project, done) {
+var createProjectRepo = function(org, project, cb) {
+  fs.ensureDir(path.join(ngSitesPath, org, project), function(err) {
+    if(err) return cb(err);
+    //Ver todos los branches que se llamen al estilo version_<num> o v<num>
+    var p;
+    if(org == config.org.name) {
+      p = openRepo({project: project});
+    } else {
+      p = new Promise(function(resolve, reject) {
+        cloneProject({org: org, project: project, dest: path.join('/tmp', org, project)}, function(err, repo) {
+          if(err) return reject(err);
+          resolve(repo);
+        })
+      });
+    }
+    var repo;
 
+      p.then(function(r) {
+        repo = r;
+        return getBranches(r);
+      })
+      .then(function(branches) {
+        //Filtrar los branches que se llamen 'version_<num>, version <num>, version<num>, v_<num>, v <num> o v<num>'
+        var promises = branches
+          .map(function(branch) {
+             return branch.name().match(/v(?:ersion)?(?:_| )?([0-9][.0-9]*)/);
+          })
+          .filter(function(match) {
+            return match;
+          })
+          .map(function(version) {
+            //Obtener el último commit de cada branch
+            return new Promise(function(resolve, reject) {
+              repo.getBranchCommit(version[0])
+                .then(function(commit) {
+                  resolve({name: version[0], num: version[1], commit: {repo: commit}});
+                })
+                .catch(reject);
+            })
+            .then(function(version) {
+              //Ver si existe el directorio
+              fs.stat(path.join(ngSitesPath, org, project, 'v'+version.num), function(err, stat) {
+                version.hasDir = stat&&stat.isDirectory();
+                resolve(version);
+              });
+            })
+            .then(function(version) {
+              //Obtengo el ultimo commit guardado en redis
+              return new Promise(function(resolve, reject) {
+                getVersionCommit({org: org, project: project, version: version.num}, function (err, commit) {
+                  if(err) return reject(err);
+                  version.commit.redis = commit;
+                  resolve(version);
+                })
+              });
+            });
+          });
+        if(!promises.length) return Promise.reject('No branches to work with.');
+        return Promise.all(promises);
+      })
+      .then(function(versions) {
+        //por cada version comparar si esta al dia
+        return versions.filter(function(version) {
+          return !version.hasDir || version.commit.repo.toString() != version.commit.redis;
+        });
+      })
+      .then(function(versions) {
+        if(!versions.length) return Promise.reject('Nothing to do.');
+
+        return Promise.all(versions.forEach(function(version) {
+          //Por cada branch a trabajar, recorrer los directorios (menos .git, bower_components y node_modules) buscando javascripts, css o imagenes
+          return new Promise(function(resolve, reject) {
+            //Creo o vacío el directorio
+            fs.emptyDir(path.join(ngSitesPath, org, project, 'v'+version.num), function(err) {
+              if(err) return reject(err);
+
+              resolve(
+                //Obtengo el arbol del branch
+                version.commit.repo.getTree()
+                .then(function(tree) {
+                  var treeWalk = function(tree) {
+                    return Promise.all(tree.entries().map(function(entry) {
+                      entryName = path.filename(entry.path());
+                      if(entry.isBlob()) {
+                        if(/.+\.js$/.test(entryName)) {
+                          var min = UglifyJS.minify(entry.getBlob().content().toString(), {fromString: true});
+                          return Promise.resolve({path: entry.path(), min: min.code});
+                        } else if (/.+\.css$/.test(entryName)) {
+                          var min = new CleanCSS().minify(entry.getBlob().content().toString());
+                          return Promise.resolve({path: entry.path(), min: min.styles});
+                        } else if (/.+\.svg$/.test(entryName)) {
+                          return new Promise(function(resolve, reject) {
+                            new Imagemin()
+                              .src(entry.getBlob().content())
+                              .use(Imagemin.svgo())
+                              .run(function(err, files) {
+                                if(err) return reject(err);
+                                resolve({path: entry.path(), min: files[0].contents});
+                              });
+                          });
+                        } else {
+                          return lookup(entry.getBlob().content())
+                                  .then(function(info) {
+                                    m = info.mime.match(/image\/(jpeg|png|gif)/.test());
+                                    if(!m[1]) return Promise({path: entry.path(), min: entry.getBlob().content()});
+                                    var middleware;
+                                    switch(m[1]) {
+                                      case 'jpeg':
+                                        middleware = Imagemin.jpegtran({progressive: true});
+                                        break;
+                                      case 'png':
+                                        middleware = Imagemin.optipng({optimizationLevel: 3});
+                                        break;
+                                      case 'gif':
+                                        middleware = Imagemin.gifsicle({interlaced: true});
+                                        break;
+                                    }
+                                    return new Promise(function(resolve, reject) {
+                                      new Imagemin()
+                                        .src(entry.getBlob().content())
+                                        .use(middleware)
+                                        .run(function(err, files) {
+                                          if(err) return reject(err);
+                                          resolve({path: entry.path(), min: files[0].contents});
+                                        });
+                                    });
+                                  })
+                                  .catch(function(err) {
+                                    return Promise.resolve(null);
+                                  });
+                        }
+                      } else {
+                        if(entryName != '.git' && entryName != 'node_modules' && entryName != 'bower_components') return treeWalk(entry);
+                        return Promise.resolve(null);
+                      }
+                    }))
+                    .then(function(results) {
+                      var r = results.filter(function(result) {
+                        return result;
+                      });
+                      return r.length?r:null;
+                    });
+                  };
+
+                  return treeWalk(tree)
+                    .then(function(filesTree) {
+                      var walkFiles = function(tree) {
+                        var files = [];
+                        tree.forEach(function(entry) {
+                          if(!entry) return;
+                          if(util.isArray(entry)) {
+                            files = files.concat(walkFiles(entry));
+                          }
+                          files.push(entry);
+                        });
+                        return files;
+                      };
+                      return walkFiles(filesTree);
+                    });
+                  //Si se encuentran javascripts, css o imagenes, replicar la estructura de directorio en ngSitesPath y minificar
+                })
+                .then(function(files) {
+                  if(!files || !files.length) return Promise.resolve();
+                  return Promise.all(files.map(function(file) {
+                    return new Promise(function(resolve, reject) {
+                      fs.outputFile(path.join(ngSitesPath, org, project, 'v'+version.num, file.path), file.min, function(err) {
+                        if(err) return reject(err);
+                        resolve();
+                      });
+                    });
+                  }));
+                });
+              );
+
+
+            });
+          })
+          .then(function() {
+            return new Promise(function(resolve, reject) {
+              //Guardar en redis cual es el último commit del branch
+              setVersionCommit({org: org, project: project, version: version.num, commit: version.commit.repo.toString()}, function(err) {
+                if(err) return reject(err);
+                resolve(versions);
+              });
+            });
+          });
+        }));
+      })
+      .then(function(versions) {
+        !versions.length && return;
+        var max = 0;
+        var numsRegExps = versions.map(function(version) {
+          if(version.num > max) {
+            max = version.num;
+          }
+          return {reg: new RegExp('v(?:ersion)?(?:_| )?'+version.num+'$'), num: version.num};
+        })
+
+        //Crear las configuraciones correspondientes para nginx
+        return getSymbolic(repo).then(function(symbolics) {
+          var hasLatest = false;
+          symbolics.forEach(function(symbolic) {
+            //Se agrega una configuracion por cada referencia simbolica que se llame PUBLIC_<nombre>
+            var target = symbolic.symbolicTarget();
+            var version = numsRegExps.filter(function(version) {
+              return version.reg.test(target);
+            });
+            if(!version.length) return;
+            var name = symbolic.name().toLowerCase().match(/^public_(.+)$/);
+            if(!name) return;
+            name[1] == 'latest' && (hasLatest = true);
+            fs.outputFileSync(path.join(ngConfPath, 'locations', org+'-'+project+'-'+name[1]+'.conf'), rendy(fs.readFileSync('nginx-location-template.conf').toString(), {
+              rule: '/'+org+'/'+project+'/'+name[1],
+              root: path.join(ngSitesPath, org, project, 'v'+version[0].num);
+            }));
+          });
+          if(!hasLatest) {
+            fs.outputFileSync(path.join(ngConfPath, 'locations', org+'-'+project+'-latest.conf'), rendy(fs.readFileSync('nginx-location-template.conf').toString(), {
+              rule: '/'+org+'/'+project+'/latest',
+              root: path.join(ngSitesPath, org, project, 'v'+max);
+            }));
+          }
+        });
+        //Si se encuentra una referencia simbolica 'LATEST', hacer una config de nginx apuntando al branch correspondiente.. caso contrario a la última versión.
+
+      });
+      .then(function() {
+        if(org != config.org.name) {
+          fs.remove(path.join('/tmp', org, project));
+        }
+        return Promise.resolve();
+      })
+      .nodeify(cb);
+  });
 }
 
 //Initialize Repositories
@@ -214,204 +483,25 @@ async.waterfall([
     iOrgs(function(org, cb) {
       fs.ensureDir(path.join(ngSitesPath, org), function(err) {
         if(err) return cb(err);
-        iRepos(org, function(project, cb) {
-          fs.ensureDir(path.join(ngSitesPath, org, project), function(err) {
-            if(err) return cb(err);
-            //Ver todos los branches que se llamen al estilo version_<num> o v<num>
-            var p;
-            if(org == config.org.name) {
-              p = openRepo({project: project});
-            } else {
-              p = new Promise(function(resolve, reject) {
-                cloneProject({org: org, project: project, dest: path.join('/tmp', org, project)}, function(err, repo) {
-                  if(err) return reject(err);
-                  resolve(repo);
-                })
-              });
+        if(org != config.org.name) {
+          getOrg(org).then(function(org){
+            if(org.url) {
+              sockets[org.name] = ioc(org.url);
             }
-            var repo;
-
-              p.then(function(r) {
-                repo = r;
-                return getBranches(r);
-              })
-              .then(function(branches) {
-                //Filtrar los branches que se llamen 'version_<num>, version <num>, version<num>, v_<num>, v <num> o v<num>'
-                var promises = branches
-                  .map(function(branch) {
-                     return branch.name().match(/v(?:ersion)?(?:_| )?([0-9][.0-9]*)/);
-                  })
-                  .filter(function(match) {
-                    return match;
-                  })
-                  .map(function(version) {
-                    //Obtener el último commit de cada branch
-                    return new Promise(function(resolve, reject) {
-                      repo.getBranchCommit(version[0])
-                        .then(function(commit) {
-                          resolve({name: version[0], num: version[1], commit: {repo: commit});
-                        })
-                        .catch(reject);
-                    })
-                    .then(function(version) {
-                      //Ver si existe el directorio
-                      fs.stat(path.join(ngSitesPath, org, project, 'v'+version.num), function(err, stat) {
-                        version.hasDir = stat&&stat.isDirectory();
-                        resolve(version);
-                      });
-                    })
-                    .then(function(version) {
-                      //Obtengo el ultimo commit guardado en redis
-                      return new Promise(function(resolve, reject) {
-                        getVersionCommit({org: org, project: project, version: version.num}, function (err, commit) {
-                          if(err) return reject(err);
-                          version.commit.redis = commit;
-                          resolve(version);
-                        })
-                      });
-                    });
-                  });
-                if(!promises.length) return Promise.reject('No branches to work with.');
-                return Promise.all(promises);
-              })
-              .then(function(versions) {
-                //por cada version comparar si esta al dia
-                return versions.filter(function(version) {
-                  return !version.hasDir || version.commit.repo.toString() != version.commit.redis;
-                });
-              })
-              .then(function(versions) {
-                if(!versions.length) return Promise.reject('Nothing to do.');
-
-                return Promise.all(versions.forEach(function(version) {
-                  //Por cada branch a trabajar, recorrer los directorios (menos .git, bower_components y node_modules) buscando javascripts, css o imagenes
-                  return new Promise(function(resolve, reject) {
-                    //Creo o vacío el directorio
-                    fs.emptyDir(path.join(ngSitesPath, org, project, 'v'+version.num), function(err) {
-                      if(err) return reject(err);
-
-                      resolve(
-                        //Obtengo el arbol del branch
-                        version.commit.repo.getTree()
-                        .then(function(tree) {
-                          var treeWalk = function(tree) {
-                            return Promise.all(tree.entries().map(function(entry) {
-                              entryName = path.filename(entry.path());
-                              if(entry.isBlob()) {
-                                if(/.+\.js$/.test(entryName)) {
-                                  var min = UglifyJS.minify(entry.getBlob().content().toString(), {fromString: true});
-                                  return Promise.resolve({path: entry.path(), min: min.code});
-                                } else if (/.+\.css$/.test(entryName)) {
-                                  var min = new CleanCSS().minify(entry.getBlob().content().toString());
-                                  return Promise.resolve({path: entry.path(), min: min.styles});
-                                } else if (/.+\.svg$/.test(entryName)) {
-                                  return new Promise(function(resolve, reject) {
-                                    new Imagemin()
-                                      .src(entry.getBlob().content())
-                                      .use(Imagemin.svgo())
-                                      .run(function(err, files) {
-                                        if(err) return reject(err);
-                                        resolve({path: entry.path(), min: files[0].contents});
-                                      });
-                                  });
-                                } else {
-                                  return lookup(entry.getBlob().content())
-                                          .then(function(info) {
-                                            m = info.mime.match(/image\/(jpeg|png|gif)/.test());
-                                            if(!m[1]) return Promise({path: entry.path(), min: entry.getBlob().content()});
-                                            var middleware;
-                                            switch(m[1]) {
-                                              case 'jpeg':
-                                                middleware = Imagemin.jpegtran({progressive: true});
-                                                break;
-                                              case 'png':
-                                                middleware = Imagemin.optipng({optimizationLevel: 3});
-                                                break;
-                                              case 'gif':
-                                                middleware = Imagemin.gifsicle({interlaced: true});
-                                                break;
-                                            }
-                                            return new Promise(function(resolve, reject) {
-                                              new Imagemin()
-                                                .src(entry.getBlob().content())
-                                                .use(middleware)
-                                                .run(function(err, files) {
-                                                  if(err) return reject(err);
-                                                  resolve({path: entry.path(), min: files[0].contents});
-                                                });
-                                            });
-                                          })
-                                          .catch(function(err) {
-                                            return Promise.resolve(null);
-                                          });
-                                }
-                              } else {
-                                if(entryName != '.git' && entryName != 'node_modules' && entryName != 'bower_components') return treeWalk(entry);
-                                return Promise.resolve(null);
-                              }
-                            }))
-                            .then(function(results) {
-                              var r = results.filter(function(result) {
-                                return result;
-                              });
-                              return r.length?r:null;
-                            });
-                          };
-
-                          return treeWalk(tree)
-                            .then(function(filesTree) {
-                              var walkFiles = function(tree) {
-                                var files = [];
-                                tree.forEach(function(entry) {
-                                  if(!entry) return;
-                                  if(util.isArray(entry)) {
-                                    files = files.concat(walkFiles(entry));
-                                  }
-                                  files.push(entry);
-                                });
-                                return files;
-                              };
-                              return walkFiles(filesTree);
-                            });
-                          //Si se encuentran javascripts, css o imagenes, replicar la estructura de directorio en ngSitesPath y minificar
-                        })
-                        .then(function(files) {
-                          if(!files || !files.length) return Promise.resolve();
-                          return Promise.all(files.map(function(file) {
-                            return new Promise(function(resolve, reject) {
-                              fs.outputFile(path.join(ngSitesPath, org, project, 'v'+version.num, file.path), file.min, function(err) {
-                                if(err) return reject(err);
-                                resolve();
-                              });
-                            });
-                          }));
-                        });
-                      );
-
-
-                    });
-                  })
-                  .then(function() {
-                    return new Promise(function(resolve, reject) {
-                      //Guardar en redis cual es el último commit del branch
-                      setVersionCommit({org: org, project: project, version: version.num, commit: version.commit.repo.toString()}, function(err) {
-                        if(err) return reject(err);
-                        resolve(versions);
-                      });
-                    });
-                  });
-                }));
-              })
-              .then(function(versions) {
-                //Crear las configuraciones correspondientes para nginx
-                //Si se encuentra una referencia simbolica 'LATEST', hacer una config de nginx apuntando al branch correspondiente.. caso contrario a la última versión.
-                //Si se encuentra una referencia simbolica 'STABLE', 'TEST' o 'DEV' hacer una config de nginx apuntando al branch correspondiente.
-              });
-              //eliminar repo en tmp
           });
+        }
+        iRepos(org, function(project, cb) {
+          createProjectRepo(org, project, cb);
         }, cb);
       });
-    }, cb);
+    }, function(err) {
+      if(err) return cb(err);
+      var conf = rendy(fs.readFileSync('nginx-template.conf').toString(), {
+        root: ngSitesPath
+      });
+      fs.outputFileSync(path.join(ngConfPath, 'cdn.conf'), conf);
+      cb();
+    });
   }
 ], function (e) {
   if(e) {
@@ -441,6 +531,11 @@ channel.on('message', function(name, message) {
         nodes[message.from] = message.node;
         channel.publish('cdn:'+message.from, {from: id, type: 're:present', node: me});
         break;
+      case 'newOrg':
+        getOrg(message.org, function(err, org) {
+          sockets[org.name] = ioc(org.url);
+        });
+        break;
     }
   } else {
     switch (message.type) {
@@ -457,7 +552,204 @@ channel.subscribe('cdn:'+id);
 channel.subscribe('cdn:nodes');
 
 
+var checkUser = function(req, res, next) {
+  //Validate user somehow
 
+  next();
+}
+
+var checkOrg = function(socket, next) {
+  //Validate org somehow
+  next();
+}
+
+var checkAtts = function(atts) {
+  !util.isArray(atts) && (atts = [atts]);
+  return function(req, res, next) {
+    var noAtts = [];
+    atts.forEach(function(att) {
+      if(!req.body[att] && !req.params[att] && !req.query[att]) {
+        noAtts.push(att);
+      }
+    });
+    if(hasAtts.length) {
+      var last = hasAtts.pop();
+      var msg = (hasAtts.length?hasAtts.join(', ')+' and ':'')+last;
+      return res.status(400).send('Required '+msg+' attribute'+(hasAtts.length?'s are':' is')+' missing.');
+    }
+    next();
+  }
+}
+
+/*======= API =======*/
+
+var api = express.Router('/api');
+
+api.use(checkUser);
+
+/****** ORGANIZACIONES *******/
+
+api.get('/org', function(req, res, next) {
+  rc.smembers('cdn:orgs', function(err, orgs) {
+    if(err) return res.status(500).send(err);
+    res.json(orgs);
+  });
+})
+
+//agregar una nueva organizacion
+api.post('/org', checkAtts('url'), function(req, res, next) {
+
+  var md5 = crypto.createHash('md5').update(config.org.name+req.body.url+(new Date().toISOString())+Math.random()).digest('hex');
+
+  request.post({
+    url: req.body.url+'/cdn/connect/'+md5,
+    form: config.org
+  }, function(err, response, body) {
+    if(err) return res.status(response.statusCode).send(body);
+    if(response.statusCode == 202) {
+      rc.sadd('cdn:pending', md5);
+      rc.set('cdn:pending:'+md5, req.body.url);
+      res.status(202).send(md5);
+    } else {
+      body = JSON.parse(body)
+      setOrg(body).then(function() {
+        sockets[org.name] = ioc(body.url);
+        channel.publish('cdn:nodes', {org: body.name});
+      });
+
+
+      res.send('ok');
+    }
+  })
+});
+
+//get list of orgs connections to approve
+api.get('/org/approve', function(req, res, next) {
+  rc.smembers('cdn:approve', function(err, md5s) {
+    var orgs = {};
+    async.each(md5s, function(md5, cb) {
+      rc.hgetall('cdn:approve:'+md5, function(err, org) {
+        if(err) return cb(err);
+        orgs[md5] = org;
+        cb();
+      })
+    }, function(err) {
+      if(err) return res.status(500).send(err);
+      res.json(orgs);
+    });
+  });
+});
+
+//set approved orgs
+api.put('/org/approve', checkAtts('orgs') function(req, res, next) {
+  res.status(202).send('ok');
+  for(var md5 in req.body.orgs) {
+    rc.sdel('cdn:approve', md5);
+    rc.hgetall('cdn:approve:'+md5, function(err, org) {
+      rc.del('cdn:approve:'+md5);
+      var options = {url: org.url+'/cdn/pending/'+md5};
+      if(req.body.orgs[md5]) {
+        setOrg(org).then(function() {
+          sockets[org.name] = ioc(org.url);
+          channel.publish('cdn:nodes', {org: org.name});
+        });
+        options.method = 'POST';
+        options.form = config.org;
+      } else {
+        options.method = 'DELETE'
+      }
+      request(options);
+    });
+  }
+});
+
+/******* PROYECTOS ********/
+
+//Listado de proyectos
+api.get('/org/:org/project', function(req, res, next) {
+  var projects = {};
+  if(req.params.org == config.org.name) {
+    rc.smembers('cdn:'+config.org.name+':projs', function(err, projs) {
+      if(err) return res.status(500).send(err);
+      async.each(projs, function(proj, cb) {
+        rc.hgetall('cdn:'+config.org.name+':proj:'+proj, function (err, obj) {
+          projects[proj] = err?{}:obj;
+          cb();
+        })
+      }, function(err) {
+        res.json(projects);
+      });
+    });
+  } else {
+    rc.sismember('cdn:orgs', req.params.org, function(err, member) {
+      if(err) return res.status(500).send(err);
+      if(!member) return res.status(404).send('Organization with name '+req.params.org+' not found.');
+      rc.hgetall('cdn:'+req.params.org, function(err, org) {
+        if(err||!org||!org.url||!sockets[org.name]) return res.status(500).send(err||'Organization with name '+req.params.org+' not found.');
+        sockets[org.name].emit('org:projects', function(err, projects) {
+          if(err) return res.status(500).send('External organization '+req.params.org+' had problems delyvering projects.');
+          res.json(projects);
+        });
+      });
+    });
+  }
+});
+
+/*======= CDN =======*/
+var cdn = express.Router('/cdn');
+
+//Receive connection from org
+cdn.post('/connect/:md5', function(req, res, next) {
+  if(config.cdn && config.cdn.accept == 'all') {
+    setOrg(req.body);
+    res.json(config.org);
+  } else {
+    rc.sadd('cdn:approve', req.params.md5);
+    rc.hmset('cdn:approve:'+req.params.md5, req.body);
+    res.status(202).send('ok');
+  }
+});
+
+//Set pending org connection
+cdn.all('/pending/:md5', function(req, res, next) {
+  var method = req.method.toLowerCase();
+  if(['post', 'delete'].indexOf(method) == -1) return res.status(400).send('Invalid method '+req.method);
+  res.status(202).send('ok');
+  rc.sismember('cdn:pending', req.params.md5, function(err, member) {
+    if(member) {
+      rc.sdel('cdn:pending', req.params.md5);
+      rc.get('cdn:pending:'+req.params.md5, function(err, url) {
+        rc.del('cdn:pending:'+req.params.md5);
+        if(err||method == 'delete') return;
+        setOrg(org).then(function() {
+          sockets[org.name] = ioc(org.url);
+          channel.publish('cdn:nodes', {org: org.name});
+        });
+      });
+    }
+  });
+});
+
+io.use(checkOrg);
+
+io.on('connection', function(socket) {
+  socket.on('org:projects', function(cb) {
+    rc.smembers('cdn:'+config.org.name+':projs', function(err, projs) {
+      if(err) return cb(err);
+      async.each(projs, function(proj, cb) {
+        rc.hgetall('cdn:'+config.org.name+':proj:'+proj, function (err, obj) {
+          projects[proj] = err?{}:obj;
+          cb();
+        })
+      }, function(err) {
+        cb(null, projects);
+      });
+    });
+  });
+})
+
+
+//cdn.del('/pending/:md5', function(req, res, next) {});
 
 app.get('/', function(req, res,next) {
   res.send('hola');
